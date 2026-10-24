@@ -1,0 +1,11 @@
+dist/
+build/
+_build/
+tests/run/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.dll
+*.log
