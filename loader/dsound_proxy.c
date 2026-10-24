@@ -70,6 +70,8 @@ __declspec(dllimport) LPSTR   __stdcall lstrcpyA(LPSTR, LPCSTR);
 __declspec(dllimport) LPSTR   __stdcall lstrcatA(LPSTR, LPCSTR);
 __declspec(dllimport) DWORD   __stdcall GetLastError(void);
 __declspec(dllimport) HANDLE  __stdcall CreateMutexA(void*, BOOL, LPCSTR);
+__declspec(dllimport) BOOL    __stdcall CopyFileA(LPCSTR, LPCSTR, BOOL);
+__declspec(dllimport) UINT    __stdcall GetSystemDirectoryA(LPSTR, UINT);
 
 #define MAX_PATH 260
 #define GENERIC_WRITE 0x40000000u
@@ -145,6 +147,18 @@ static void resolve_real(void) {
     lstrcpyA(path, g_dir);
     lstrcatA(path, "dsound_orig.dll");
     g_real = LoadLibraryA(path);
+    if (!g_real) {
+        /* Self-install: copy the 32-bit system DLL next to the game as dsound_orig.dll. */
+        char sys[MAX_PATH];
+        UINT n = GetSystemDirectoryA(sys, MAX_PATH);
+        if (n && n + 16 < MAX_PATH) {
+            lstrcatA(sys, "\\dsound.dll");
+            if (CopyFileA(sys, path, 0)) {
+                line("copied system dsound.dll -> dsound_orig.dll");
+                g_real = LoadLibraryA(path);
+            }
+        }
+    }
     if (g_real) {
         g_fn_DirectSoundCreate            = (Fn3)GetProcAddress(g_real, "DirectSoundCreate");
         g_fn_DirectSoundCreate8           = (Fn3)GetProcAddress(g_real, "DirectSoundCreate8");
@@ -257,7 +271,7 @@ BOOL __stdcall DllMain(HMODULE mod, DWORD reason, LPVOID reserved) {
         while (n > 0 && g_dir[n - 1] != '\\') n--;
         if (n < MAX_PATH) g_dir[n] = 0;
         log_open();
-        line("=== RE5 dsound.dll plugin loader v2.0.0 (DllMain) ===");
+        line("=== RE5 dsound.dll plugin loader v2.0.1 (DllMain) ===");
         t = CreateThread(0, 0, LoaderThread, 0, 0, 0);
         if (t) CloseHandle(t);
     }

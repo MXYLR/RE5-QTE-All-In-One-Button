@@ -2,6 +2,7 @@ dist/
 build/
 _build/
 tests/run/
+release/
 *.obj
 *.exp
 *.lib
