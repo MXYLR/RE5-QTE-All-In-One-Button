@@ -50,7 +50,7 @@
  *    prompt that turns out to be flagged non-strict; it is off by default.
  *  - The plugin writes only the log file and the five call bytes; it never writes game data.
  */
-#define RE5QTE_VERSION 154u
+#define RE5QTE_VERSION 158u
 
 #include <stdint.h>
 #include <stddef.h>
@@ -174,6 +174,7 @@ static uint32_t g_maxPromptLog = 600u;
 static uint32_t g_qteGlyph = 69u;   /* icon id written over QTE prompt types; 0 = leave stock */
 static uint32_t g_qteSingle = 1u;   /* rewrite QTE masks to X so one letter is shown */
 static uint32_t g_uiRewrites;      /* QTE requests whose type was rewritten for the UI */
+static uint32_t g_extraTypes;      /* extra prompt types the key answers (ExtraTypes=) */
 
 static int g_installed;
 static int g_keyWasDown;
@@ -386,6 +387,21 @@ static void config_line(const char* s, uint32_t n) {
     else if (key_eq(s, keyEnd, "MaxPromptLog")) g_maxPromptLog = parse_u(v, vn);
     else if (key_eq(s, keyEnd, "Glyph"))    g_qteGlyph = parse_u(v, vn);
     else if (key_eq(s, keyEnd, "SingleKey")) g_qteSingle = parse_u(v, vn) != 0;
+    else if (key_eq(s, keyEnd, "ExtraTypes")) {
+        uint32_t i2 = 0;
+        while (i2 < vn) {
+            uint32_t id = 0;
+            int seen = 0;
+            while (i2 < vn && (v[i2] == ' ' || v[i2] == ',' || v[i2] == '\t')) i2++;
+            while (i2 < vn && v[i2] >= '0' && v[i2] <= '9') {
+                id = id * 10u + (uint32_t)(v[i2] - '0');
+                i2++;
+                seen = 1;
+            }
+            if (seen && id < 32u) g_extraTypes |= 1u << id;
+            if (!seen) break;
+        }
+    }
 }
 
 static void config_load(void) {
@@ -482,6 +498,7 @@ static void log_prompt(uint32_t req, uint32_t stamp, uint32_t type, uint32_t mas
     p = puts1(p, " act=0x");         p = fmt_hex(p, act, 8);
     p = puts1(p, " ev=");            p = fmt_u(p, ev);
     p = puts1(p, " t=0x");           p = fmt_hex(p, rd32(req + REQ_TIME), 8);
+    p = puts1(p, " g=");             p = fmt_u(p, (type < 32u) ? rd8(GLYPH_TABLE + type) : 0u);
     *p = 0; log_line(b);
 }
 
@@ -697,6 +714,7 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
                 *(volatile uint32_t*)(uintptr_t)(self + 0x38) = 69u;      /* glyph E    */
             }
             *(volatile uint32_t*)(uintptr_t)(req + REQ_TYPE) = 1u;
+            *(volatile uint32_t*)(uintptr_t)(req + 0x18u) = 1u;   /* request category too */
             if (g_uiRewrites < 30u) {
                 char b[112], *p = b;
                 g_uiRewrites++;
@@ -741,7 +759,8 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
                 /* The manual key answers exactly the prompts the Grab/Combo/Special rules
                  * accept, so E replaces the QTE buttons (strict is never set in this build). */
                 if ((strict || (g_autoCombo && combo) || (g_autoSpecial && special) ||
-                     grabbed || g_forceAll) && key_fires()) {
+                     grabbed || g_forceAll ||
+                     (type < 32u && (g_extraTypes & (1u << type)))) && key_fires()) {
                     g_forced++;
                     if (g_forced <= 40u) log_force(slot, type, req, mask);
                     inject_button(pad, slot, mask);
@@ -802,11 +821,35 @@ static int install_hooks(void) {
  * makes the prompt show that letter.  The button the handlers require is the mask table, which is
  * untouched - and the key path answers the prompt anyway. */
 static void apply_glyph_override(void) {
-    /* Nothing is patched globally any more: the mask and glyph tables are shared with ordinary
-     * context prompts.  Rewriting type 15 there also turned the "hold A+D to turn the mechanism"
-     * prompt into a single X prompt, so E stopped the mechanism instead of turning it.  The merge
-     * happens per request and only for real QTEs (strict, or while an enemy holds the player). */
+    /* Nothing is patched globally: the mask and glyph tables are shared with ordinary context
+     * prompts.  Rewriting type 15 there also turned the "hold A+D to turn the mechanism" prompt
+     * into a single X prompt, so E stopped the mechanism instead of turning it.  The QTE merge
+     * happens per request and only for real QTEs (strict, or while an enemy holds the player).
+     * For the extra types named in the ini, only that type's icon byte is pointed at 69 (E). */
+    uint32_t i;
+    for (i = 0; i < 32u; i++) {
+        if (g_extraTypes & (1u << i)) {
+            const uintptr_t at = GLYPH_TABLE + i;
+            uint8_t id = 69u;
+            if (span_readable(at, 1)) write_mem(at, &id, 1);
+        }
+    }
     log_u("[ui] per-request QTE prompt merge -> ", g_qteSingle);
+    log_u("[cfg] ExtraTypes mask -> ", g_extraTypes);
+}
+
+/* The game builds the glyph table from the key bindings; keep the extra types on the letter E in
+ * case it regenerates the table (e.g. after the key options are changed). */
+static void reapply_extra_glyphs(void) {
+    uint32_t i;
+    if (!g_extraTypes) return;
+    for (i = 0; i < 32u; i++) {
+        if (g_extraTypes & (1u << i)) {
+            const uintptr_t at = GLYPH_TABLE + i;
+            uint8_t id = 69u;
+            if (span_readable(at, 1)) write_mem(at, &id, 1);
+        }
+    }
 }
 
 static void restore_stock(void) {
@@ -888,7 +931,7 @@ static DWORD STDCALL Worker(void* unused) {
     uint32_t tick = 0;
     (void)unused;
     log_open();
-    log_line("=== RE5 QTE single-key v1.5.4 | plugins\\RE5QTE.dll ===");
+    log_line("=== RE5 QTE single-key v1.5.8 | plugins\\RE5QTE.dll ===");
     config_load();
     log_u("[cfg] Enabled=", (uint32_t)g_enabled);
     log_u("[cfg] Key VK=", g_key);
@@ -910,7 +953,7 @@ static DWORD STDCALL Worker(void* unused) {
     for (;;) {
         pSleep(500u);
         probe_players();
-        if (++tick % 20u == 0u) log_stats();
+        if (++tick % 20u == 0u) { log_stats(); reapply_extra_glyphs(); }
     }
 }
 

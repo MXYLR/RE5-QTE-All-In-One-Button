@@ -58,6 +58,7 @@ ForegroundOnly = 1
 Log = 1
 MaxPromptLog = 600
 SingleKey = 1   ; 1 = 把可识别的 QTE 提示合并成单个 E；0 = 保留原组合显示
+ExtraTypes = 6  ; 额外让 E 应答的提示类型（如 6 = 濒死“连按急救”），图标也改成 E
 Glyph = 0       ; 旧版全局图标覆盖（已废弃，保持 0）
 ```
 
