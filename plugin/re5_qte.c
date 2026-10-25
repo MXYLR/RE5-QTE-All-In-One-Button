@@ -50,7 +50,7 @@
  *    prompt that turns out to be flagged non-strict; it is off by default.
  *  - The plugin writes only the log file and the five call bytes; it never writes game data.
  */
-#define RE5QTE_VERSION 158u
+#define RE5QTE_VERSION 159u
 
 #include <stdint.h>
 #include <stddef.h>
@@ -698,16 +698,15 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
         const uint32_t strict = rd8((uintptr_t)req + REQ_STRICT);
         const uint32_t state = rd8((uintptr_t)req + REQ_STATE);
         const uint32_t used = rd32((uintptr_t)req + REQ_USED);
-        /* The on-screen prompt is drawn from the request type, not from the mask table: the
-         * combo types show one keyboard letter per button ("E+Q", "A+D") even after the mask is
-         * reduced.  Rewriting the type to the plain X type makes the game draw its single E
-         * letter, and the handlers then wait for X as well. */
-        /* The on-screen prompt is drawn from the request type and the slot's copy of the
-         * category (request+0x18 -> ActionSlot+0x10, copied when the slot is armed).  Merely
-         * changing the mask leaves "E+Q"/"A+D" on screen; the slot has to be turned into a plain
-         * button prompt too: category 1, mask X, icon 69 (the letter E).  That covers the grab
-         * escape (type 20 / category 6, drawn as the two stick keys) as well. */
-        if (g_qteSingle && state != 1u && (strict || PlayerInEnemyEvent(slot))) {
+        const uint32_t origMask = (type < 32u) ? rd32(MASK_TABLE + type * 4u) : 0u;
+        const int extra = (type < 32u) && ((g_extraTypes & (1u << type)) != 0u);
+        /* The on-screen prompt is drawn from the request type and the request category: the
+         * combo types show one keyboard letter per button ("E+Q"), the stick prompt shows the two
+         * direction keys, and an extra type shows the key bound to its button (the dying
+         * "mash to heal" prompt shows Q).  The slot's copy alone is not enough - the request has
+         * to look like a plain button prompt as well: type 1, category 1, mask X, icon 69.  That
+         * is what turned the grab escape from "A+D" into "E". */
+        if (g_qteSingle && state != 1u && (strict || extra || PlayerInEnemyEvent(slot))) {
             if (self && span_readable((uintptr_t)self, 0x40)) {
                 *(volatile uint32_t*)(uintptr_t)(self + 0x10) = 1u;       /* category 1 */
                 *(volatile uint32_t*)(uintptr_t)(self + 0x18) = 0x8000u;  /* mask X     */
@@ -753,7 +752,7 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
                 if (why) {
                     g_autoForced++;
                     if (g_autoForced <= 60u) log_auto(slot, type, req, why);
-                    inject_button(pad, slot, mask);
+                    inject_button(pad, slot, (extra && origMask) ? origMask : mask);
                     return 1;
                 }
                 /* The manual key answers exactly the prompts the Grab/Combo/Special rules
@@ -763,7 +762,7 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
                      (type < 32u && (g_extraTypes & (1u << type)))) && key_fires()) {
                     g_forced++;
                     if (g_forced <= 40u) log_force(slot, type, req, mask);
-                    inject_button(pad, slot, mask);
+                    inject_button(pad, slot, (extra && origMask) ? origMask : mask);
                     return 1;
                 }
             }
@@ -931,7 +930,7 @@ static DWORD STDCALL Worker(void* unused) {
     uint32_t tick = 0;
     (void)unused;
     log_open();
-    log_line("=== RE5 QTE single-key v1.5.8 | plugins\\RE5QTE.dll ===");
+    log_line("=== RE5 QTE single-key v1.5.9 | plugins\\RE5QTE.dll ===");
     config_load();
     log_u("[cfg] Enabled=", (uint32_t)g_enabled);
     log_u("[cfg] Key VK=", g_key);
