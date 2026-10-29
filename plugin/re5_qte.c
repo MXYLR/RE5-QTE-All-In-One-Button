@@ -50,7 +50,7 @@
  *    prompt that turns out to be flagged non-strict; it is off by default.
  *  - The plugin writes only the log file and the five call bytes; it never writes game data.
  */
-#define RE5QTE_VERSION 159u
+#define RE5QTE_VERSION 169u
 
 #include <stdint.h>
 #include <stddef.h>
@@ -160,6 +160,8 @@ static GetWindowThreadProcessIdFn pGetWindowThreadProcessId;
 
 /* ---- state ---- */
 static int g_enabled = 1;      /* master switch                          */
+static int g_noStrictFail = 1; /* patch out the "wrong button fails the prompt" rule */
+static uint32_t g_swReq, g_swStamp, g_swTick, g_strictProbes, g_strictPatched;
 static int g_forceAll = 0;     /* 1 = the key answers every prompt, not only QTE */
 static int g_auto = 0;         /* 0 = manual key (default), 1 = auto-answer */
 static int g_autoGrab = 1;     /* auto while the player is in an enemy event act */
@@ -387,6 +389,7 @@ static void config_line(const char* s, uint32_t n) {
     else if (key_eq(s, keyEnd, "MaxPromptLog")) g_maxPromptLog = parse_u(v, vn);
     else if (key_eq(s, keyEnd, "Glyph"))    g_qteGlyph = parse_u(v, vn);
     else if (key_eq(s, keyEnd, "SingleKey")) g_qteSingle = parse_u(v, vn) != 0;
+    else if (key_eq(s, keyEnd, "NoStrictFail")) g_noStrictFail = parse_u(v, vn) != 0;
     else if (key_eq(s, keyEnd, "ExtraTypes")) {
         uint32_t i2 = 0;
         while (i2 < vn) {
@@ -639,6 +642,12 @@ static int EventClass(uint32_t pawn, uint32_t* outEv, uint32_t* outSrc, uint32_t
     return cls;
 }
 
+/* Scripted scene action: the player is locked into the event action. */
+static int PlayerInEventAct(uint32_t slot) {
+    const uint32_t pawn = PlayerPawn(slot);
+    return pawn && rd32(pawn + CH_ACTION_ID) == 0x80000000u;
+}
+
 static int PlayerInEnemyEvent(uint32_t slot) {
     const int cls = EventClass(PlayerPawn(slot), 0, 0, 0);
     return cls == 1 || cls == 2 || cls == 3;
@@ -700,13 +709,40 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
         const uint32_t used = rd32((uintptr_t)req + REQ_USED);
         const uint32_t origMask = (type < 32u) ? rd32(MASK_TABLE + type * 4u) : 0u;
         const int extra = (type < 32u) && ((g_extraTypes & (1u << type)) != 0u);
+        /* The key produces pad bit 0x2000, which is outside every strict combo; the strict rule
+         * fails on any extra button.  Drop that bit everywhere the handler reads input. */
+        if (strict && state != 1u) {
+            uint32_t pwn, ct2, sp3, pi2;
+            if (pad && span_readable((uintptr_t)pad, 0x50u)) {
+                *(volatile uint32_t*)(pad + 0x34u) &= ~0x2000u;
+                *(volatile uint32_t*)(pad + 0x3Cu) &= ~0x2000u;
+            }
+            pwn = PlayerPawn(slot);
+            if (pwn) {
+                ct2 = rd32(pwn + 0x2D64u);
+                if (ct2 && span_readable(ct2 + 0x708u, 0x50u)) {
+                    *(volatile uint32_t*)(ct2 + 0x708u + 0x34u) &= ~0x2000u;
+                    *(volatile uint32_t*)(ct2 + 0x708u + 0x3Cu) &= ~0x2000u;
+                }
+            }
+            sp3 = rd32s(SPAD_PTR);
+            if (sp3 && span_readable(sp3, 0x800u)) {
+                for (pi2 = 0; pi2 < 2u; pi2++) {
+                    uint32_t q2 = sp3 + SPAD_PADS + pi2 * SPAD_STRIDE;
+                    if (!span_readable(q2, 0x180u)) continue;
+                    *(volatile uint32_t*)(q2 + SPAD_ON) &= ~0x2000u;
+                    *(volatile uint32_t*)(q2 + SPAD_ON + 4u) &= ~0x2000u;
+                    *(volatile uint32_t*)(q2 + SPAD_ON + 8u) &= ~0x2000u;
+                }
+            }
+        }
         /* The on-screen prompt is drawn from the request type and the request category: the
          * combo types show one keyboard letter per button ("E+Q"), the stick prompt shows the two
          * direction keys, and an extra type shows the key bound to its button (the dying
          * "mash to heal" prompt shows Q).  The slot's copy alone is not enough - the request has
          * to look like a plain button prompt as well: type 1, category 1, mask X, icon 69.  That
          * is what turned the grab escape from "A+D" into "E". */
-        if (g_qteSingle && state != 1u && (strict || extra || PlayerInEnemyEvent(slot))) {
+        if (g_qteSingle && state != 1u && (extra || (PlayerInEnemyEvent(slot) && !strict))) {
             if (self && span_readable((uintptr_t)self, 0x40)) {
                 *(volatile uint32_t*)(uintptr_t)(self + 0x10) = 1u;       /* category 1 */
                 *(volatile uint32_t*)(uintptr_t)(self + 0x18) = 0x8000u;  /* mask X     */
@@ -742,10 +778,12 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
              * already set (request+0x70, bit = slot); mirror that so a held key cannot re-fire
              * a request that the stock code would have ignored. */
             if (g_enabled && !(used & (1u << slot))) {
+                /* Scripted multi-stage scenes: answer every stage as soon as it appears.  The
+                 * "wrong button fails" rule is patched out and the stage's own buttons are put on
+                 * the pad, so no key press is needed and the sequence cannot stall on input. */
                 const char* why = 0;
-                if (g_auto && LocalPlayer(slot)) {
+                if (g_auto && LocalPlayer(slot) && !strict) {
                     if (g_autoGrab && grabbed) why = "grab";
-                    else if (g_autoStrict && strict) why = "strict";
                     else if (g_autoCombo && combo) why = "combo";
                     else if (g_autoSpecial && special) why = "special";
                 }
@@ -755,9 +793,20 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
                     inject_button(pad, slot, (extra && origMask) ? origMask : mask);
                     return 1;
                 }
+                /* Multi-stage scenes: with the key's own pad bit cleared, put the buttons this
+                 * stage asks for on the pad and let the stock handler decide (its per-stage state
+                 * machine keeps running, so the scene does not desync like a forced accept). */
+                if (strict && key_fires()) {
+                    /* Translate the key into the buttons this stage asks for and let the stock
+                     * handler accept it at the moment the player pressed - the same timing as
+                     * pressing the real keys.  No forced accept, so the scene's own multi-stage
+                     * state machine keeps running. */
+                    inject_button(pad, slot, origMask ? origMask : mask);
+                    return g_origCheck(self, edx, pad, slot);
+                }
                 /* The manual key answers exactly the prompts the Grab/Combo/Special rules
                  * accept, so E replaces the QTE buttons (strict is never set in this build). */
-                if ((strict || (g_autoCombo && combo) || (g_autoSpecial && special) ||
+                if (!strict && ((g_autoCombo && combo) || (g_autoSpecial && special) ||
                      grabbed || g_forceAll ||
                      (type < 32u && (g_extraTypes & (1u << type)))) && key_fires()) {
                     g_forced++;
@@ -851,6 +900,21 @@ static void reapply_extra_glyphs(void) {
     }
 }
 
+static void patch_strict_fail(void) {
+    /* 0x00763ACB and 0x00E8F485: je -> jmp, so an extra button never fails a strict prompt. */
+    const uintptr_t sites[2] = { 0x00763ACBu, 0x00E8F481u };
+    uint32_t i;
+    if (!g_noStrictFail) return;
+    for (i = 0; i < 2u; i++) {
+        if (span_readable(sites[i], 1u) && rd8(sites[i]) == 0x74u) {
+            uint8_t v = 0xEBu;
+            write_mem(sites[i], &v, 1);
+            g_strictPatched++;
+        }
+    }
+    log_u("[patch] strict-fail sites patched=", g_strictPatched);
+}
+
 static void restore_stock(void) {
     if (g_installed && call_target(CALL_ACTION_CHECK) == (uintptr_t)(void*)QteCheck)
         patch_call(CALL_ACTION_CHECK, (void*)FN_ACTION_CHECK);
@@ -930,7 +994,7 @@ static DWORD STDCALL Worker(void* unused) {
     uint32_t tick = 0;
     (void)unused;
     log_open();
-    log_line("=== RE5 QTE single-key v1.5.9 | plugins\\RE5QTE.dll ===");
+    log_line("=== RE5 QTE single-key v1.6.9 (key translated, stock handler decides) | plugins\\RE5QTE.dll ===");
     config_load();
     log_u("[cfg] Enabled=", (uint32_t)g_enabled);
     log_u("[cfg] Key VK=", g_key);
@@ -947,6 +1011,7 @@ static DWORD STDCALL Worker(void* unused) {
     if (!wait_for_image()) return 0;
     if (!install_hooks()) { log_line("[boot] ERROR: hook install failed; nothing changed"); return 0; }
     apply_glyph_override();
+    patch_strict_fail();
     log_line("[boot] hook installed: 0x00767576 (ButtonMgr::checkAll) -> QteCheck");
     log_line("[boot] stock ActionSlot::Check 0x00766F00 is still called for every non-QTE prompt");
     for (;;) {

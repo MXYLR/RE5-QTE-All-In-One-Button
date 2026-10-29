@@ -58,6 +58,8 @@ ForegroundOnly = 1
 Log = 1
 MaxPromptLog = 600
 SingleKey = 1   ; 1 = 把可识别的 QTE 提示合并成单个 E；0 = 保留原组合显示
+NoStrictFail = 1 ; 1 = 关闭游戏"按错即判失败"的规则（多段 QTE 靠它不再被多余按键判死）
+ExtraTypes = 25 ; 额外让 E 应答的提示类型（25 = 濒死"连按急救"）
 ExtraTypes = 25 ; 额外让 E 应答的提示类型（25 = 濒死“连按急救”），提示也合并显示成 E
 Glyph = 0       ; 旧版全局图标覆盖（已废弃，保持 0）
 ```
@@ -88,7 +90,7 @@ tests\run_tests.bat       :: 5 种模式全部应 PASS
 
 `loader\` 还需要 `dist\dsound_orig.dll`：把 `C:\Windows\SysWOW64\dsound.dll` 复制过去改名即可。
 
-## 原理
+## 多段 QTE（威斯克等）
 
 游戏里所有屏幕按键提示都由 `sActionButton::ButtonMgr` 驱动，每帧调用
 `ActionSlot::Check (0x00766F00)`；整份镜像里对该函数的调用只有一处

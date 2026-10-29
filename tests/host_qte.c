@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     printf("plugin installed (status=0x%x)\n", status());
 
     /* 1: strict prompt + key down -> key forces it                          */
-    set_request(3, 1, 0, 0, 0); put32(ORIG_ANSWER, 0); g_keyDown = 1;
+    set_request(3, 1, 0, 0, 0); put32(ORIG_ANSWER, 1); g_keyDown = 1;
     results[0] = invoke();
     Sleep(80);  /* outside the 50 ms tap window */
     /* 2: same prompt, key up -> auto only if Strict=1                       */
@@ -236,7 +236,7 @@ int main(int argc, char** argv) {
         };
         unsigned want[10];
         want[0] = 1;
-        want[1] = !strcmp(mode, "auto_all") ? 1u : 0u;
+        want[1] = 0;
         want[2] = !strcmp(mode, "forceall") ? 1u : 0u;
         want[3] = 0; want[4] = 0; want[5] = 1;
         want[6] = (!strcmp(mode, "auto_all") || !strcmp(mode, "auto_enemy")) ? 1u : 0u;
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
 
     if (!strcmp(mode, "tap")) {
         /* in Tap mode a held key must not repeat, a fresh press must fire     */
-        set_request(3, 1, 0, 0, 0); put32(ORIG_ANSWER, 0); g_keyDown = 1;
+        set_request(20, 0, 0, 0, 0); put32(ORIG_ANSWER, 0); g_keyDown = 1;
         results[10] = invoke();    /* press edge -> 1                            */
         Sleep(80);
         results[11] = invoke();    /* still held, no new edge -> 0               */

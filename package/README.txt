@@ -1,4 +1,4 @@
-RE5 QTE All-In-One-Button  v1.5.9
+RE5 QTE All-In-One-Button  v1.6.9
 ==================================
 
 把《生化危机 5》（Steam 黄金版 1.2.0 / re5dx9.exe，DX9）里所有 QTE 统一成一个键（默认 E）：
