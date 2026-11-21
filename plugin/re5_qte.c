@@ -50,7 +50,7 @@
  *    prompt that turns out to be flagged non-strict; it is off by default.
  *  - The plugin writes only the log file and the five call bytes; it never writes game data.
  */
-#define RE5QTE_VERSION 169u
+#define RE5QTE_VERSION 197u
 
 #include <stdint.h>
 #include <stddef.h>
@@ -161,6 +161,9 @@ static GetWindowThreadProcessIdFn pGetWindowThreadProcessId;
 /* ---- state ---- */
 static int g_enabled = 1;      /* master switch                          */
 static int g_noStrictFail = 1; /* patch out the "wrong button fails the prompt" rule */
+static int g_padInput = 0;      /* make the QTE handlers read the passed pad */
+static int g_qteKeys = 1;       /* answer strict QTE key queries with the player key   */
+static uint32_t g_qteKeyTick;   /* a strict prompt was checked this recently           */
 static uint32_t g_swReq, g_swStamp, g_swTick, g_strictProbes, g_strictPatched;
 static int g_forceAll = 0;     /* 1 = the key answers every prompt, not only QTE */
 static int g_auto = 0;         /* 0 = manual key (default), 1 = auto-answer */
@@ -174,14 +177,38 @@ static int g_logPrompts = 1;   /* write every distinct prompt seen       */
 static uint32_t g_key = 0x45;  /* E                                      */
 static uint32_t g_maxPromptLog = 600u;
 static uint32_t g_qteGlyph = 69u;   /* icon id written over QTE prompt types; 0 = leave stock */
-static uint32_t g_qteSingle = 1u;   /* rewrite QTE masks to X so one letter is shown */
-static uint32_t g_uiRewrites;      /* QTE requests whose type was rewritten for the UI */
+static uint32_t g_qteSingle = 1u;   /* answer strict QTEs with the key (native mask kept) */
 static uint32_t g_extraTypes;      /* extra prompt types the key answers (ExtraTypes=) */
+static uint32_t g_eOnlyTypes;      /* extra types whose native button is blocked (EOnlyTypes=) */
+static uint32_t g_entryTypes;      /* non-strict prompt types that open a QTE chain (EntryTypes=) */
 
 static int g_installed;
 static int g_keyWasDown;
 static uint32_t g_tapUntil;
+static uint32_t g_keyLogs;
 static uint32_t g_checks, g_promptsSeen, g_strictSeen, g_forced, g_autoForced, g_promptLogs;
+static uint32_t g_entryProbes;
+/* Entry hand-off window: after the chain-entry answer the scene keeps polling its own input for a
+ * few frames.  The one-frame injection answers ActionSlot::Check but not that poll, so the event
+ * aborts.  Mask/slot/deadline keep the entry's native button on every input copy like a real hold.
+ * The window is FIXED: v1.8.9 extended it while the key stayed down, and the one stalled E entry
+ * held the mask 11438 ms with no strict stage ever appearing; every chain that advanced did so
+ * within ~300 ms of the hold ending. */
+static uint32_t g_entryHoldMask, g_entryHoldSlot = 0xFFFFFFFFu, g_entryHoldUntil, g_entryHoldStart;
+#define ENTRY_HOLD_MS 300u
+static uint32_t g_holdLogs;
+/* Entry answer timing: the entry prompt appears while the player is still in the hit reaction
+ * (act 0x1b-0x1e / 0x00) and the scene drops the event one frame after a command submitted then
+ * (every stalled attempt was answered in that state; the one that opened the chain was answered at
+ * act 0x02).  A press arms a wait, the answer fires on the first ready frame.  v1.9.4 tried treating
+ * act 0x00 as ready after 150 ms; both answers below 600 ms prompt age (266 and 329 ms) started the
+ * event only for the scene to end it on the next probe, while every answer at >= 797 ms opened the
+ * chain.  So act 0x00 keeps waiting for the cap: the scene itself needs roughly that long after the
+ * prompt before it accepts the entry.  press= in the [entry] log measures the press-to-answer wait. */
+static uint32_t g_entryArmReq, g_entryArmStamp, g_entryArmStart, g_entryArmedAt;
+static int g_entryArmed, g_entryWaitLogged;
+static uint32_t g_entryWaitLogs, g_entryBlockLogs, g_extraBlockLogs;
+#define ENTRY_ACT_WAIT_MS 600u
 
 typedef int (FASTCALL *CheckFn)(uint32_t self, void* edx, uint32_t pad, uint32_t slot);
 static CheckFn g_origCheck = (CheckFn)FN_ACTION_CHECK;
@@ -347,6 +374,23 @@ static int key_eq(const char* a, uint32_t n, const char* lit) {
 
 static int g_section;   /* 0 = [General], 1 = [Auto] */
 
+/* "9,11, 15" -> bits in *mask; unknown tokens end the list. */
+static void parse_type_list(const char* v, uint32_t vn, uint32_t* mask) {
+    uint32_t i = 0;
+    while (i < vn) {
+        uint32_t id = 0;
+        int seen = 0;
+        while (i < vn && (v[i] == ' ' || v[i] == ',' || v[i] == '\t')) i++;
+        while (i < vn && v[i] >= '0' && v[i] <= '9') {
+            id = id * 10u + (uint32_t)(v[i] - '0');
+            i++;
+            seen = 1;
+        }
+        if (seen && id < 32u) *mask |= 1u << id;
+        if (!seen) break;
+    }
+}
+
 static void config_line(const char* s, uint32_t n) {
     uint32_t i, eq = 0, eqRaw = 0, keyEnd = 0, k = 0;
     const char* v; uint32_t vn;
@@ -390,21 +434,11 @@ static void config_line(const char* s, uint32_t n) {
     else if (key_eq(s, keyEnd, "Glyph"))    g_qteGlyph = parse_u(v, vn);
     else if (key_eq(s, keyEnd, "SingleKey")) g_qteSingle = parse_u(v, vn) != 0;
     else if (key_eq(s, keyEnd, "NoStrictFail")) g_noStrictFail = parse_u(v, vn) != 0;
-    else if (key_eq(s, keyEnd, "ExtraTypes")) {
-        uint32_t i2 = 0;
-        while (i2 < vn) {
-            uint32_t id = 0;
-            int seen = 0;
-            while (i2 < vn && (v[i2] == ' ' || v[i2] == ',' || v[i2] == '\t')) i2++;
-            while (i2 < vn && v[i2] >= '0' && v[i2] <= '9') {
-                id = id * 10u + (uint32_t)(v[i2] - '0');
-                i2++;
-                seen = 1;
-            }
-            if (seen && id < 32u) g_extraTypes |= 1u << id;
-            if (!seen) break;
-        }
-    }
+    else if (key_eq(s, keyEnd, "PadInput")) g_padInput = parse_u(v, vn) != 0;
+    else if (key_eq(s, keyEnd, "QteKeys")) g_qteKeys = parse_u(v, vn) != 0;
+    else if (key_eq(s, keyEnd, "ExtraTypes")) parse_type_list(v, vn, &g_extraTypes);
+    else if (key_eq(s, keyEnd, "EOnlyTypes")) parse_type_list(v, vn, &g_eOnlyTypes);
+    else if (key_eq(s, keyEnd, "EntryTypes")) parse_type_list(v, vn, &g_entryTypes);
 }
 
 static void config_load(void) {
@@ -450,19 +484,37 @@ static int foreground_is_us(void) {
     return pid == GetCurrentProcessId();
 }
 
+/* One poll per millisecond: checkAll runs both action slots in the same frame, and a press edge must
+ * stay visible to the check that answers the prompt instead of being eaten by the other slot. */
+static uint32_t g_keyPollTick;
+
+/* A press/release trace, so a test log can tell "E was down while the prompt was on screen but
+ * nothing answered" from "the player did not press E". */
+static void log_key(int down, uint32_t now) {
+    char b[64], *p = b;
+    if (g_keyLogs >= 300u) return;
+    g_keyLogs++;
+    p = puts1(p, "[key] state="); p = puts1(p, down ? "down" : "up");
+    p = puts1(p, " t=0x"); p = fmt_hex(p, now, 8);
+    *p = 0; log_line(b);
+}
+
+static void key_poll(void) {
+    const uint32_t now = GetTickCount();
+    int down;
+    if (now == g_keyPollTick) return;
+    g_keyPollTick = now;
+    down = (!g_fgOnly || foreground_is_us()) ? key_down() : 0;
+    if (down != g_keyWasDown) log_key(down, now);
+    if (down && !g_keyWasDown) g_tapUntil = now + 50u;
+    g_keyWasDown = down;
+}
+
 /* Press edge that survives the two action slots of one frame: a tap counts for 50 ms. */
 static int key_fires(void) {
-    int down = key_down();
-    uint32_t now;
-    if (!g_fgOnly || foreground_is_us()) {
-        now = GetTickCount();
-        if (down && !g_keyWasDown) g_tapUntil = now + 50u;
-        g_keyWasDown = down;
-        if (g_tapMode) return (int32_t)(now - g_tapUntil) < 0;
-        return down;
-    }
-    g_keyWasDown = down;
-    return 0;
+    key_poll();
+    if (g_tapMode) return (int32_t)(GetTickCount() - g_tapUntil) < 0;
+    return g_keyWasDown;
 }
 
 /* ------------------------------- prompt logging ------------------------------- */
@@ -525,6 +577,37 @@ static void log_auto(uint32_t slot, uint32_t type, uint32_t req, const char* why
     *p = 0; log_line(b);
 }
 
+/* Why the entry's native button stopped being re-injected: a strict stage took over, or the
+ * deadline passed with no strict stage.  The second case is the "chain never opened" signature. */
+static void log_hold_end(const char* why, uint32_t now) {
+    char b[128], *p = b;
+    if (g_holdLogs >= 80u) return;
+    g_holdLogs++;
+    p = puts1(p, "[hold] end="); p = puts1(p, why);
+    p = puts1(p, " mask=0x"); p = fmt_hex(p, g_entryHoldMask, 8);
+    p = puts1(p, " held="); p = fmt_u(p, now - g_entryHoldStart);
+    *p = 0; log_line(b);
+}
+
+/* Answer logs once per (request, stamp) per distinct stock result: a stage that is answered on
+ * every call would otherwise spend the probe budget in a few frames. */
+static uint32_t g_ansReq[16], g_ansStamp[16], g_ansRes[16], g_ansNext;
+static int answer_new(uint32_t req, uint32_t stamp, uint32_t res) {
+    uint32_t i;
+    for (i = 0; i < 16u; i++) {
+        if (g_ansReq[i] == req && g_ansStamp[i] == stamp) {
+            if (g_ansRes[i] == res) return 0;
+            g_ansRes[i] = res;
+            return 1;
+        }
+    }
+    g_ansReq[g_ansNext & 15u] = req;
+    g_ansStamp[g_ansNext & 15u] = stamp;
+    g_ansRes[g_ansNext & 15u] = res;
+    g_ansNext++;
+    return 1;
+}
+
 /* -------------------------------------------------------------------------------------------
  * Scope=Enemy: the player is inside an enemy-driven event act (a grab or a boss hold/attack).
  *
@@ -573,6 +656,15 @@ static uint32_t PlayerPawn(uint32_t slot) {
     pawn = rd32s(mgr + 0x24u + slot * 4u);
     if (!pawn || !span_readable(pawn, 0x3000u)) return 0;
     return pawn;
+}
+
+/* The action the player must leave before the chain-entry command is submitted: the hit reaction
+ * (0x1b-0x1e) and act 0x00.  A command sent while one of these runs starts the event only for the
+ * scene to end it on the next probe.  act 0x00 is also idle; the caller lets the cap cover it. */
+static int EntryActReady(uint32_t act) {
+    if (act == 0u) return 0;
+    if (act >= 0x1Bu && act <= 0x1Eu) return 0;
+    return 1;
 }
 
 /* ch+0x2DA8: 0 = this player's own pad, 1 = AI, 2 = driven by the network partner. Auto-counter
@@ -669,6 +761,36 @@ static int PlayerInEnemyEvent(uint32_t slot) {
 #define CH_CTRL     0x2D64u
 #define CTRL_PAD    0x708u
 
+/* The game reads buttons from three copies: the ButtonMgr pad passed to Check, the player's ctrl
+ * pad (pawn+0x2D64)+0x708, and the script pads.  The scene's own poll sees a press left in any of
+ * them, so "this button must not answer" has to mean all three. */
+static void scrub_button(uint32_t pad, uint32_t slot, uint32_t mask) {
+    uint32_t pawn, ctl, spad, i;
+    if (!mask) return;
+    if (pad && span_readable(pad, 0x50u)) {
+        *(volatile uint32_t*)(pad + PP_ON) &= ~mask;
+        *(volatile uint32_t*)(pad + PP_TRG) &= ~mask;
+    }
+    pawn = PlayerPawn(slot);
+    if (pawn) {
+        ctl = rd32(pawn + CH_CTRL);
+        if (ctl && span_readable(ctl + CTRL_PAD, 0x50u)) {
+            *(volatile uint32_t*)(ctl + CTRL_PAD + PP_ON) &= ~mask;
+            *(volatile uint32_t*)(ctl + CTRL_PAD + PP_TRG) &= ~mask;
+        }
+    }
+    spad = rd32s(SPAD_PTR);
+    if (spad && span_readable(spad, 0x800u)) {
+        for (i = 0; i < 2u; i++) {
+            uint32_t p = spad + SPAD_PADS + i * SPAD_STRIDE;
+            if (!span_readable(p, 0x180u)) continue;
+            *(volatile uint32_t*)(p + SPAD_ON) &= ~mask;
+            *(volatile uint32_t*)(p + SPAD_ON + 4u) &= ~mask;
+            *(volatile uint32_t*)(p + SPAD_ON + 8u) &= ~mask;
+        }
+    }
+}
+
 static void inject_button(uint32_t pad, uint32_t slot, uint32_t mask) {
     uint32_t pawn, ctl, spad, i;
     if (!mask) return;
@@ -699,67 +821,57 @@ static void inject_button(uint32_t pad, uint32_t slot, uint32_t mask) {
 
 static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t slot) {
     uint32_t req = 0;
+    uint32_t padTrgIn = 0;
     g_checks++;
+    key_poll();
+    /* Capture the pad's new-press bits before any injection below: the entry's own hold puts
+     * 0x8000 on this pad, and that must not read as a fresh native press next time. */
+    if (pad && span_readable((uintptr_t)pad, 0x40u)) padTrgIn = rd32((uintptr_t)pad + 0x3Cu);
     if (self && span_readable((uintptr_t)self, 0x40)) req = rd32((uintptr_t)self + 0x0C);
+    /* Keep the entry's native button held for a FIXED hand-off window.  A strict stage ends the
+     * hold before it is injected: a lingering 0x8000 would be a wrong extra button for stages whose
+     * mask is not X and would burn their "used" bit.  Never extend the deadline from the key state:
+     * a held key must not keep the mask on the pad, or the scene never shows the next stage. */
+    if (g_entryHoldSlot != 0xFFFFFFFFu) {
+        const uint32_t now = GetTickCount();
+        if ((int32_t)(now - g_entryHoldUntil) >= 0) {
+            log_hold_end("timeout", now);
+            g_entryHoldSlot = 0xFFFFFFFFu;
+        } else if (g_enabled && slot == g_entryHoldSlot) {
+            const int strictUp = req && span_readable((uintptr_t)req, 0x80) &&
+                                 rd8((uintptr_t)req + REQ_STRICT) && rd8((uintptr_t)req + REQ_STATE) != 1u;
+            if (!strictUp) inject_button(pad, slot, g_entryHoldMask);
+        }
+    }
     if (req && span_readable((uintptr_t)req, 0x80)) {
         uint32_t type = rd32((uintptr_t)req + REQ_TYPE);
         const uint32_t stamp = rd32((uintptr_t)req + REQ_STAMP);
         const uint32_t strict = rd8((uintptr_t)req + REQ_STRICT);
         const uint32_t state = rd8((uintptr_t)req + REQ_STATE);
         const uint32_t used = rd32((uintptr_t)req + REQ_USED);
-        const uint32_t origMask = (type < 32u) ? rd32(MASK_TABLE + type * 4u) : 0u;
         const int extra = (type < 32u) && ((g_extraTypes & (1u << type)) != 0u);
+        const int eonly = (type < 32u) && ((g_eOnlyTypes & (1u << type)) != 0u);
         /* The key produces pad bit 0x2000, which is outside every strict combo; the strict rule
          * fails on any extra button.  Drop that bit everywhere the handler reads input. */
         if (strict && state != 1u) {
-            uint32_t pwn, ct2, sp3, pi2;
-            if (pad && span_readable((uintptr_t)pad, 0x50u)) {
-                *(volatile uint32_t*)(pad + 0x34u) &= ~0x2000u;
-                *(volatile uint32_t*)(pad + 0x3Cu) &= ~0x2000u;
+            uint32_t xmask = 0x2000u;
+            /* Same-frame ordering: the stale entry slot may already have injected its bit before the
+             * strict slot is checked.  Drop any live entry mask here too, whichever slot reports the
+             * strict stage - both slots belong to the same player and the pad copies are shared. */
+            if (g_entryHoldSlot != 0xFFFFFFFFu) {
+                xmask |= g_entryHoldMask;
+                log_hold_end("strict", GetTickCount());
+                g_entryHoldUntil = 0;
+                g_entryHoldSlot = 0xFFFFFFFFu;
             }
-            pwn = PlayerPawn(slot);
-            if (pwn) {
-                ct2 = rd32(pwn + 0x2D64u);
-                if (ct2 && span_readable(ct2 + 0x708u, 0x50u)) {
-                    *(volatile uint32_t*)(ct2 + 0x708u + 0x34u) &= ~0x2000u;
-                    *(volatile uint32_t*)(ct2 + 0x708u + 0x3Cu) &= ~0x2000u;
-                }
-            }
-            sp3 = rd32s(SPAD_PTR);
-            if (sp3 && span_readable(sp3, 0x800u)) {
-                for (pi2 = 0; pi2 < 2u; pi2++) {
-                    uint32_t q2 = sp3 + SPAD_PADS + pi2 * SPAD_STRIDE;
-                    if (!span_readable(q2, 0x180u)) continue;
-                    *(volatile uint32_t*)(q2 + SPAD_ON) &= ~0x2000u;
-                    *(volatile uint32_t*)(q2 + SPAD_ON + 4u) &= ~0x2000u;
-                    *(volatile uint32_t*)(q2 + SPAD_ON + 8u) &= ~0x2000u;
-                }
-            }
+            scrub_button(pad, slot, xmask);
         }
-        /* The on-screen prompt is drawn from the request type and the request category: the
-         * combo types show one keyboard letter per button ("E+Q"), the stick prompt shows the two
-         * direction keys, and an extra type shows the key bound to its button (the dying
-         * "mash to heal" prompt shows Q).  The slot's copy alone is not enough - the request has
-         * to look like a plain button prompt as well: type 1, category 1, mask X, icon 69.  That
-         * is what turned the grab escape from "A+D" into "E". */
-        if (g_qteSingle && state != 1u && (extra || (PlayerInEnemyEvent(slot) && !strict))) {
-            if (self && span_readable((uintptr_t)self, 0x40)) {
-                *(volatile uint32_t*)(uintptr_t)(self + 0x10) = 1u;       /* category 1 */
-                *(volatile uint32_t*)(uintptr_t)(self + 0x18) = 0x8000u;  /* mask X     */
-                *(volatile uint32_t*)(uintptr_t)(self + 0x38) = 69u;      /* glyph E    */
-            }
-            *(volatile uint32_t*)(uintptr_t)(req + REQ_TYPE) = 1u;
-            *(volatile uint32_t*)(uintptr_t)(req + 0x18u) = 1u;   /* request category too */
-            if (g_uiRewrites < 30u) {
-                char b[112], *p = b;
-                g_uiRewrites++;
-                p = puts1(p, "[ui] req=0x"); p = fmt_hex(p, req, 8);
-                p = puts1(p, " type="); p = fmt_u(p, type);
-                p = puts1(p, " -> 1 (slot cat=1 mask=X)");
-                *p = 0; log_line(b);
-            }
-            type = 1u;
-        }
+        /* The request is never rewritten.  Its type selects the button the stage waits for, the glyph
+         * the HUD draws and the command checkAll submits after ActionSlot::Check returns 1; rewriting
+         * it made every stage an X stage, so stages whose native button is not X could not be answered
+         * and the scene stalled.  The single-key answer is produced by putting the NATIVE mask on the
+         * pad below.  Only the slot's icon copy is pointed at E, which the stock code overwrites from
+         * the glyph table on its next call and so cannot desync the scene. */
         if (type >= 1u && type < 0x1Eu && state != 1u) {
             const uint32_t mask = rd32(MASK_TABLE + type * 4u);
             const int combo = mask && (mask & (mask - 1u)) != 0;
@@ -767,6 +879,7 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
             const int grabbed = (g_autoGrab || g_forceAll) ? PlayerInEnemyEvent(slot) : 0;
             g_promptsSeen++;
             if (strict) g_strictSeen++;
+            if (strict && state != 1u) g_qteKeyTick = GetTickCount();
             if (g_promptLogs < g_maxPromptLog) {
                 const uint32_t pawn = PlayerPawn(slot);
                 const uint32_t act = pawn ? rd32(pawn + CH_ACTION_ID) : 0;
@@ -778,6 +891,30 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
              * already set (request+0x70, bit = slot); mirror that so a held key cannot re-fire
              * a request that the stock code would have ignored. */
             if (g_enabled && !(used & (1u << slot))) {
+                /* EOnlyTypes prompts are E-only.  Type 1 (the normal melee prompt shown during the
+                 * hit reaction) is answered by the mouse's native 0x8000; the scene's own poll reads
+                 * the ctrl pad and SPAD copies just like the entry scrub found in v1.9.3, so clear the
+                 * mask from all three every live frame.  E still answers through the manual branch
+                 * below (inject + forced accept).  Types in ExtraTypes but not EOnlyTypes (the spray)
+                 * keep the native button and may additionally be answered with E. */
+                if (!strict && g_qteSingle && extra && eonly && mask && LocalPlayer(slot)) {
+                    const int nat = (padTrgIn & mask) != 0u;
+                    scrub_button(pad, slot, mask);
+                    if (nat && g_extraBlockLogs < 40u && answer_new(req, stamp, 4u)) {
+                        char b[160], *pp = b;
+                        g_extraBlockLogs++;
+                        pp = puts1(pp, "[native] block req=0x"); pp = fmt_hex(pp, req, 8);
+                        pp = puts1(pp, " stamp=0x"); pp = fmt_hex(pp, stamp, 8);
+                        pp = puts1(pp, " type="); pp = fmt_u(pp, type);
+                        pp = puts1(pp, " slot="); pp = fmt_u(pp, slot);
+                        pp = puts1(pp, " mask=0x"); pp = fmt_hex(pp, mask, 8);
+                        *pp = 0; log_line(b);
+                    }
+                }
+                /* Show E on the prompt without touching the request (same icon copy as the strict and
+                 * entry branches; the stock code rewrites it from the glyph table). */
+                if (!strict && g_qteSingle && extra && self && span_readable((uintptr_t)self, 0x40u))
+                    *(volatile uint32_t*)(uintptr_t)(self + 0x38u) = 69u;
                 /* Scripted multi-stage scenes: answer every stage as soon as it appears.  The
                  * "wrong button fails" rule is patched out and the stage's own buttons are put on
                  * the pad, so no key press is needed and the sequence cannot stall on input. */
@@ -790,28 +927,145 @@ static int FASTCALL QteCheck(uint32_t self, void* edx, uint32_t pad, uint32_t sl
                 if (why) {
                     g_autoForced++;
                     if (g_autoForced <= 60u) log_auto(slot, type, req, why);
-                    inject_button(pad, slot, (extra && origMask) ? origMask : mask);
+                    inject_button(pad, slot, mask);
                     return 1;
                 }
                 /* Multi-stage scenes: with the key's own pad bit cleared, put the buttons this
                  * stage asks for on the pad and let the stock handler decide (its per-stage state
                  * machine keeps running, so the scene does not desync like a forced accept). */
-                if (strict && key_fires()) {
-                    /* Translate the key into the buttons this stage asks for and let the stock
-                     * handler accept it at the moment the player pressed - the same timing as
-                     * pressing the real keys.  No forced accept, so the scene's own multi-stage
-                     * state machine keeps running. */
-                    inject_button(pad, slot, origMask ? origMask : mask);
-                    return g_origCheck(self, edx, pad, slot);
+                /* Show E on the strict prompt without touching the request: only the slot icon changes,
+                 * so the scene keeps its own type/mask and cannot desync, while the injected buttons
+                 * (and nothing else) answer the stage. */
+                if (strict && g_qteSingle && state != 1u && self && span_readable((uintptr_t)self, 0x40u))
+                    *(volatile uint32_t*)(uintptr_t)(self + 0x38u) = 69u;
+                if (strict && g_qteSingle && key_fires()) {
+                    /* Answer while the key is down, not only on a fresh edge: a press made during
+                     * the grab animation, or a key still held from the previous stage, used to leave
+                     * the prompt unanswered until the player released and pressed again.  The
+                     * stage's NATIVE mask goes on the pad, so the stock handler and the command
+                     * checkAll submits stay the ones the scene made. */
+                    int r;
+                    const uint32_t cat = rd32((uintptr_t)req + 0x18u);
+                    inject_button(pad, slot, mask);
+                    r = g_origCheck(self, edx, pad, slot);
+                    if (g_strictProbes < 80u && answer_new(req, stamp, (uint32_t)(r ? 1u : 0u))) {
+                        char b[160], *pp = b;
+                        g_strictProbes++;
+                        pp = puts1(pp, "[strict] req=0x"); pp = fmt_hex(pp, req, 8);
+                        pp = puts1(pp, " stamp=0x"); pp = fmt_hex(pp, stamp, 8);
+                        pp = puts1(pp, " type="); pp = fmt_u(pp, type);
+                        pp = puts1(pp, " cat="); pp = fmt_u(pp, cat);
+                        pp = puts1(pp, " mask=0x"); pp = fmt_hex(pp, mask, 8);
+                        pp = puts1(pp, " stock="); pp = fmt_u(pp, (uint32_t)(r ? 1u : 0u));
+                        *pp = 0; log_line(b);
+                    }
+                    return r;
+                }
+                /* Chain entry: the non-strict button that opens a scripted multi-stage QTE
+                 * (Wesker's grab shows type 9 right before its strict stages).  It is neither a
+                 * combo, a special nor an enemy-event prompt, so the rules below skip it;
+                 * EntryTypes names the types explicitly.  The key answers while held - not only on
+                 * a fresh edge - and the type's native mask goes on the pad, so the stock state
+                 * machine still owns the request: the same contract the strict path uses. */
+                if (!strict && type < 32u && (g_entryTypes & (1u << type))) {
+                    if (g_qteSingle && self && span_readable((uintptr_t)self, 0x40u))
+                        *(volatile uint32_t*)(uintptr_t)(self + 0x38u) = 69u;
+                    {
+                        const uint32_t now = GetTickCount();
+                        const uint32_t pawn = PlayerPawn(slot);
+                        uint32_t act = 0;
+                        int native;
+                        if (pawn) act = rd32(pawn + CH_ACTION_ID);
+                        if (g_entryArmReq != req || g_entryArmStamp != stamp) {
+                            g_entryArmReq = req;
+                            g_entryArmStamp = stamp;
+                            g_entryArmStart = now;
+                            g_entryArmed = 0;
+                            g_entryWaitLogged = 0;
+                        }
+                        /* The mouse answers on the pad's new-press bit.  Use the bit captured at
+                         * the top of this call, before the entry hold re-injected its own 0x8000. */
+                        native = mask && (padTrgIn & mask) != 0u;
+                        if (key_fires()) {
+                            if (!g_entryArmed) g_entryArmedAt = now;
+                            g_entryArmed = 1;
+                        }
+                        /* One press of E is latched through the get-up; answering waits for the
+                         * first frame the hit reaction is over, capped so an unreadable/stuck act
+                         * still answers instead of swallowing the prompt.  Every stalled entry
+                         * (v1.8.9 and v1.9.0) was answered while act was a hit reaction
+                         * (0x1b-0x1e); both v1.9.0 mouse successes answered at 0x0.  act 0x00 is
+                         * not ready by itself: v1.9.4's 150 ms settle answers at 266/329 ms prompt
+                         * age both had the scene end the event on the next probe. */
+                        if (g_entryArmed && (!pawn || EntryActReady(act) ||
+                            (int32_t)(now - (g_entryArmStart + ENTRY_ACT_WAIT_MS)) >= 0)) {
+                            int r;
+                            inject_button(pad, slot, mask);
+                            g_entryHoldMask = mask;
+                            g_entryHoldSlot = slot;
+                            g_entryHoldStart = now;
+                            g_entryHoldUntil = now + ENTRY_HOLD_MS;
+                            r = g_origCheck(self, edx, pad, slot);
+                            if (g_entryProbes < 80u && answer_new(req, stamp, (uint32_t)(r ? 1u : 0u))) {
+                                char b[192], *pp = b;
+                                g_entryProbes++;
+                                pp = puts1(pp, "[entry] req=0x"); pp = fmt_hex(pp, req, 8);
+                                pp = puts1(pp, " stamp=0x"); pp = fmt_hex(pp, stamp, 8);
+                                pp = puts1(pp, " type="); pp = fmt_u(pp, type);
+                                pp = puts1(pp, " slot="); pp = fmt_u(pp, slot);
+                                pp = puts1(pp, " mask=0x"); pp = fmt_hex(pp, mask, 8);
+                                pp = puts1(pp, " stock="); pp = fmt_u(pp, (uint32_t)(r ? 1u : 0u));
+                                pp = puts1(pp, " hold="); pp = fmt_u(pp, ENTRY_HOLD_MS);
+                                pp = puts1(pp, " act=0x"); pp = fmt_hex(pp, act, 8);
+                                pp = puts1(pp, " waited="); pp = fmt_u(pp, now - g_entryArmStart);
+                                pp = puts1(pp, " press="); pp = fmt_u(pp, now - g_entryArmedAt);
+                                *pp = 0; log_line(b);
+                            }
+                            g_entryArmed = 0;
+                            g_entryWaitLogged = 0;
+                            return r;
+                        }
+                        if (g_entryArmed && !g_entryWaitLogged && g_entryWaitLogs < 80u) {
+                            char b[160], *pp = b;
+                            g_entryWaitLogs++;
+                            g_entryWaitLogged = 1;
+                            pp = puts1(pp, "[entry] wait req=0x"); pp = fmt_hex(pp, req, 8);
+                            pp = puts1(pp, " stamp=0x"); pp = fmt_hex(pp, stamp, 8);
+                            pp = puts1(pp, " type="); pp = fmt_u(pp, type);
+                            pp = puts1(pp, " slot="); pp = fmt_u(pp, slot);
+                            pp = puts1(pp, " act=0x"); pp = fmt_hex(pp, act, 8);
+                            pp = puts1(pp, " cap="); pp = fmt_u(pp, ENTRY_ACT_WAIT_MS);
+                            *pp = 0; log_line(b);
+                        }
+                        /* The chain entry is E-only for the local player: the native button (the
+                         * mouse's LMB) must not start it.  Every pad copy the scene polls has to
+                         * lose the bit - clearing only the ButtonMgr pad still let the script's
+                         * own poll see the click and start the grab. */
+                        if (mask && LocalPlayer(slot)) {
+                            scrub_button(pad, slot, mask);
+                            if (native && g_entryBlockLogs < 40u && answer_new(req, stamp, 3u)) {
+                                char b[160], *pp = b;
+                                g_entryBlockLogs++;
+                                pp = puts1(pp, "[entry] block req=0x"); pp = fmt_hex(pp, req, 8);
+                                pp = puts1(pp, " stamp=0x"); pp = fmt_hex(pp, stamp, 8);
+                                pp = puts1(pp, " type="); pp = fmt_u(pp, type);
+                                pp = puts1(pp, " slot="); pp = fmt_u(pp, slot);
+                                pp = puts1(pp, " mask=0x"); pp = fmt_hex(pp, mask, 8);
+                                pp = puts1(pp, " act=0x"); pp = fmt_hex(pp, act, 8);
+                                *pp = 0; log_line(b);
+                            }
+                        }
+                    }
                 }
                 /* The manual key answers exactly the prompts the Grab/Combo/Special rules
-                 * accept, so E replaces the QTE buttons (strict is never set in this build). */
+                 * accept, so E replaces the QTE buttons (strict is never set in this build).
+                 * ExtraTypes prompts were scrubbed above, so E is their only input. */
                 if (!strict && ((g_autoCombo && combo) || (g_autoSpecial && special) ||
                      grabbed || g_forceAll ||
                      (type < 32u && (g_extraTypes & (1u << type)))) && key_fires()) {
                     g_forced++;
                     if (g_forced <= 40u) log_force(slot, type, req, mask);
-                    inject_button(pad, slot, (extra && origMask) ? origMask : mask);
+                    inject_button(pad, slot, mask);
                     return 1;
                 }
             }
@@ -859,6 +1113,9 @@ static int install_hooks(void) {
         log_line("[hook] ERROR: call site verify failed after the write");
         return 0;
     }
+    /* The request is left exactly as the game made it: rewriting it to another type makes the stage
+     * require that type's key binding (in this setup the mouse), which is what made the QTE answer to
+     * the left button.  E answers the native request through the pad injection below. */
     g_installed = 1;
     return 1;
 }
@@ -882,8 +1139,10 @@ static void apply_glyph_override(void) {
             if (span_readable(at, 1)) write_mem(at, &id, 1);
         }
     }
-    log_u("[ui] per-request QTE prompt merge -> ", g_qteSingle);
+    log_u("[ui] SingleKey -> ", g_qteSingle);
     log_u("[cfg] ExtraTypes mask -> ", g_extraTypes);
+    log_u("[cfg] EOnlyTypes mask -> ", g_eOnlyTypes);
+    log_u("[cfg] EntryTypes mask -> ", g_entryTypes);
 }
 
 /* The game builds the glyph table from the key bindings; keep the extra types on the letter E in
@@ -901,11 +1160,13 @@ static void reapply_extra_glyphs(void) {
 }
 
 static void patch_strict_fail(void) {
-    /* 0x00763ACB and 0x00E8F485: je -> jmp, so an extra button never fails a strict prompt. */
-    const uintptr_t sites[2] = { 0x00763ACBu, 0x00E8F481u };
+    /* 0x00763ACB: je -> jmp, so an extra button never fails a strict prompt.  The second site used by
+     * v1.8.4 (0x00E8F481) is not QTE code at all - it is list bookkeeping in an unrelated function, and
+     * patching its conditional jump changed that function's behaviour, so it is gone. */
+    const uintptr_t sites[1] = { 0x00763ACBu };
     uint32_t i;
     if (!g_noStrictFail) return;
-    for (i = 0; i < 2u; i++) {
+    for (i = 0; i < 1u; i++) {
         if (span_readable(sites[i], 1u) && rd8(sites[i]) == 0x74u) {
             uint8_t v = 0xEBu;
             write_mem(sites[i], &v, 1);
@@ -913,6 +1174,73 @@ static void patch_strict_fail(void) {
         }
     }
     log_u("[patch] strict-fail sites patched=", g_strictPatched);
+}
+
+/* The QTE handlers ask this gate which input source to read: in keyboard mode it makes them
+ * read the keyboard bitmap array, so the pad we write never reaches them.  Force the pad path. */
+static unsigned char STDCALL PadForce(unsigned dev) { (void)dev; return 1u; }
+
+/* The QTE handlers read the keyboard through the game's own key queries (0x79A4D0 held, 0x79A3E0
+ * pressed, 0x79A430 released).  When a strict prompt is on screen these calls are redirected here:
+ * the key held down by the player answers every button the stage waits for, and with no key down
+ * nothing answers it - so the mouse can no longer start a QTE and E answers all of them. */
+typedef int (STDCALL *KeyFn)(int action, int player);
+static KeyFn g_origKeyOn = (KeyFn)0x0079A4D0u;
+static KeyFn g_origKeyTrg = (KeyFn)0x0079A3E0u;
+static KeyFn g_origKeyRel = (KeyFn)0x0079A430u;
+static uint32_t g_qteKeyTick;
+
+static int STDCALL KeyOnHook(int action, int player) {
+    if (g_qteKeyTick && (uint32_t)(GetTickCount() - g_qteKeyTick) < 150u) return key_down() ? 1 : 0;
+    return g_origKeyOn(action, player);
+}
+static int STDCALL KeyTrgHook(int action, int player) {
+    if (g_qteKeyTick && (uint32_t)(GetTickCount() - g_qteKeyTick) < 150u) return key_down() ? 1 : 0;
+    return g_origKeyTrg(action, player);
+}
+static int STDCALL KeyRelHook(int action, int player) {
+    if (g_qteKeyTick && (uint32_t)(GetTickCount() - g_qteKeyTick) < 150u) return 0;
+    return g_origKeyRel(action, player);
+}
+
+static void patch_key_calls(void) {
+    static const uint32_t onSites[] = {0x007639BDu,0x007639D4u,0x00763A27u,0x00763A3Eu,0x00763D44u,0x00763D62u,0x00763F0Au,0x00763F21u,0x00763F39u,0x00763F51u};
+    static const uint32_t trgSites[] = {0x0076379Fu,0x007637B6u,0x007637CEu,0x007637E6u,0x007639ECu,0x00763A06u,0x00763A56u,0x00763A70u,0x00763BBBu,0x00763BD9u,0x00763BF8u,0x00763C17u,0x00766375u,0x00766393u,0x007663B2u,0x007663D1u,0x007664DDu,0x007664FBu};
+    static const uint32_t relSites[] = {0x007638A5u,0x007638BCu,0x007638D4u,0x007638ECu};
+    uint32_t i, ok = 0;
+    if (!g_qteKeys) return;
+    for (i = 0; i < sizeof(onSites)/sizeof(onSites[0]); i++) {
+        const uintptr_t s = onSites[i];
+        if (span_readable(s, 5u) && rd8(s) == 0xE8u && call_target(s) == 0x0079A4D0u && patch_call(s, (void*)KeyOnHook)) ok++;
+    }
+    for (i = 0; i < sizeof(trgSites)/sizeof(trgSites[0]); i++) {
+        const uintptr_t s = trgSites[i];
+        if (span_readable(s, 5u) && rd8(s) == 0xE8u && call_target(s) == 0x0079A3E0u && patch_call(s, (void*)KeyTrgHook)) ok++;
+    }
+    for (i = 0; i < sizeof(relSites)/sizeof(relSites[0]); i++) {
+        const uintptr_t s = relSites[i];
+        if (span_readable(s, 5u) && rd8(s) == 0xE8u && call_target(s) == 0x0079A430u && patch_call(s, (void*)KeyRelHook)) ok++;
+    }
+    log_u("[patch] QTE key-query calls redirected=", ok);
+}
+static void patch_pad_input(void) {
+    static const uint32_t sites[11] = {
+        0x0076377Du, 0x00763891u, 0x00763980u, 0x00763B88u, 0x00763D27u, 0x00763EF7u,
+        0x00766342u, 0x007664C2u, 0x0076652Eu, 0x00766608u, 0x00766827u
+    };
+    uint32_t i, ok = 0;
+    if (!g_padInput) return;
+    for (i = 0; i < 11u; i++) {
+        const uintptr_t s = sites[i];
+        if (!span_readable(s, 5u) || rd8(s) != 0xE8u) continue;
+        if (call_target(s) != 0x00799AF0u) continue;
+        {
+            const int32_t rel = (int32_t)((uintptr_t)(void*)PadForce - (s + 5u));
+            write_mem(s + 1u, &rel, 4u);
+            ok++;
+        }
+    }
+    log_u("[patch] QTE handler input-gate calls redirected=", ok);
 }
 
 static void restore_stock(void) {
@@ -994,7 +1322,7 @@ static DWORD STDCALL Worker(void* unused) {
     uint32_t tick = 0;
     (void)unused;
     log_open();
-    log_line("=== RE5 QTE single-key v1.6.9 (key translated, stock handler decides) | plugins\\RE5QTE.dll ===");
+    log_line("=== RE5 QTE single-key v1.9.7 (EOnlyTypes drives the native-button scrub; spray type 25 keeps left mouse; entry 600ms window kept) | plugins\\RE5QTE.dll ===");
     config_load();
     log_u("[cfg] Enabled=", (uint32_t)g_enabled);
     log_u("[cfg] Key VK=", g_key);
@@ -1012,6 +1340,8 @@ static DWORD STDCALL Worker(void* unused) {
     if (!install_hooks()) { log_line("[boot] ERROR: hook install failed; nothing changed"); return 0; }
     apply_glyph_override();
     patch_strict_fail();
+    patch_pad_input();
+    patch_key_calls();
     log_line("[boot] hook installed: 0x00767576 (ButtonMgr::checkAll) -> QteCheck");
     log_line("[boot] stock ActionSlot::Check 0x00766F00 is still called for every non-QTE prompt");
     for (;;) {
